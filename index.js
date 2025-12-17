@@ -12,24 +12,22 @@ const port = process.env.PORT || 5000;
 
 app.use(express.json());
 
-// ---------------- CORS ----------------
+// ---------------- CORS (FINAL FIX) ----------------
 const allowedOrigins = ["http://localhost:5173", process.env.CLIENT_URL].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow requests with no origin (Postman/server-to-server)
-      if (!origin) return cb(null, true);
-
-      // allow listed origins
+      if (!origin) return cb(null, true); // Postman/server-to-server
       if (allowedOrigins.includes(origin)) return cb(null, true);
-
-      // block with explicit message (easier debugging than cb(null,false))
-      return cb(new Error("Not allowed by CORS: " + origin), false);
+      return cb(null, false); // silently block unknown origin
     },
     credentials: true,
   })
 );
+
+// ✅ IMPORTANT (Express 5 compatible): preflight for all routes
+app.options(/.*/, cors());
 
 // ---------------- Firebase Admin ----------------
 const serviceAccount = require("./firebase-admin-key.json");
@@ -52,18 +50,13 @@ const normalizeEmail = (email) =>
 
 // ---------------- MongoDB ----------------
 const client = new MongoClient(process.env.DB_URI, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
+  serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
 
 // ---------------- JWT middleware ----------------
 const verifyJWT = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ")) {
     return res.status(401).send({ message: "Unauthorized (no token)" });
   }
 
@@ -82,7 +75,7 @@ app.get("/", (req, res) => res.send("✅ Server running"));
 // ---------------- JWT exchange ----------------
 app.post("/jwt", async (req, res) => {
   try {
-    const { token } = req.body;
+    const { token } = req.body || {};
     if (!token) return res.status(400).send({ message: "Token missing" });
 
     const decoded = await admin.auth().verifyIdToken(token);
@@ -127,14 +120,13 @@ async function run() {
       updatedAt: 1,
     };
 
-    // helpers
     const getDBUser = async (email) => {
       const e = normalizeEmail(email);
       if (!e) return null;
       return usersCollection.findOne({ email: e });
     };
 
-    // role middlewares
+    // ---------------- Role middlewares ----------------
     const verifyAdmin = async (req, res, next) => {
       try {
         const user = await getDBUser(req.decoded?.email);
@@ -172,8 +164,6 @@ async function run() {
     };
 
     // ---------------- USERS ----------------
-
-    // ✅ Create/Upsert user
     app.post("/users", async (req, res) => {
       try {
         const u = req.body || {};
@@ -195,21 +185,16 @@ async function run() {
 
         const result = await usersCollection.updateOne(
           { email },
-          {
-            $set: { ...safeUser, updatedAt: new Date() },
-            $setOnInsert: { createdAt: new Date() },
-          },
+          { $set: { ...safeUser, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
           { upsert: true }
         );
 
         res.send(result);
       } catch (err) {
-        console.log("POST /users error:", err.message);
-        res.status(500).send({ message: "Failed to save user" });
+        res.status(500).send({ message: "Failed to save user", error: err.message });
       }
     });
 
-    // ✅ Logged in user profile
     app.get("/users/me", verifyJWT, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
@@ -242,26 +227,22 @@ async function run() {
       }
     });
 
-    // ✅ Public users list (ONLY if you really want it public)
     app.get("/users", async (req, res) => {
       try {
         const users = await usersCollection
           .find({}, { projection: safeUserProjection })
           .sort({ createdAt: -1 })
-          .limit(200) // prevent huge dump
+          .limit(500)
           .toArray();
-
         res.send(users);
       } catch {
         res.status(500).send({ message: "Server error" });
       }
     });
 
-    // ✅ Donor search (Search.jsx)
     app.get("/donors", async (req, res) => {
       try {
         const { bloodGroup, district, upazila } = req.query;
-
         const query = { role: "donor", status: "active" };
         if (bloodGroup) query.bloodGroup = bloodGroup;
         if (district) query.district = district;
@@ -278,14 +259,12 @@ async function run() {
       }
     });
 
-    // ✅ Admin get users (for admin dashboard)
     app.get("/admin/users", verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const users = await usersCollection
           .find({}, { projection: safeUserProjection })
           .sort({ createdAt: -1 })
           .toArray();
-
         res.send(users);
       } catch {
         res.status(500).send({ message: "Server error" });
@@ -312,25 +291,16 @@ async function run() {
 
         const fundAgg = await fundingCollection
           .aggregate([
-            {
-              $group: {
-                _id: null,
-                totalFunding: { $sum: "$amount" },
-                totalFundingCount: { $sum: 1 },
-              },
-            },
+            { $group: { _id: null, totalFunding: { $sum: "$amount" }, totalFundingCount: { $sum: 1 } } },
           ])
           .toArray();
-
-        const totalFunding = fundAgg[0]?.totalFunding || 0;
-        const totalFundingCount = fundAgg[0]?.totalFundingCount || 0;
 
         res.send({
           totalAllUsers,
           totalUsers: totalDonors,
           totalRequests,
-          totalFunding,
-          totalFundingCount,
+          totalFunding: fundAgg[0]?.totalFunding || 0,
+          totalFundingCount: fundAgg[0]?.totalFundingCount || 0,
           requestByStatus,
         });
       } catch {
@@ -345,7 +315,7 @@ async function run() {
         const { amount, trxId, note } = req.body || {};
 
         const numericAmount = Number(amount);
-        if (!numericAmount || numericAmount <= 0) {
+        if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
           return res.status(400).send({ message: "Valid amount required" });
         }
 
@@ -369,14 +339,12 @@ async function run() {
       }
     });
 
-    // ✅ fundings list: admin sees all, others see own
     app.get("/fundings", verifyJWT, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
         const dbUser = await getDBUser(email);
 
         const query = dbUser?.role === "admin" ? {} : { email };
-
         const items = await fundingCollection.find(query).sort({ createdAt: -1 }).toArray();
         res.send(items);
       } catch (err) {
@@ -385,8 +353,6 @@ async function run() {
     });
 
     // ---------------- DONATION REQUESTS ----------------
-
-    // ✅ Public list
     app.get("/donation-requests", async (req, res) => {
       try {
         const { status, page = 1, limit = 12 } = req.query;
@@ -412,7 +378,6 @@ async function run() {
       }
     });
 
-    // ✅ IMPORTANT: keep /my and /my-recent BEFORE /:id
     app.get("/donation-requests/my-recent", verifyJWT, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
@@ -453,7 +418,6 @@ async function run() {
       }
     });
 
-    // ✅ Private details
     app.get("/donation-requests/:id", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
@@ -468,7 +432,6 @@ async function run() {
       }
     });
 
-    // ✅ Create request
     app.post("/donation-requests", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
@@ -497,7 +460,6 @@ async function run() {
       }
     });
 
-    // ✅ Donate route
     app.patch("/donation-requests/:id/donate", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const { id } = req.params;
@@ -513,7 +475,7 @@ async function run() {
           return res.status(400).send({ message: "Only pending requests can be donated" });
         }
 
-        const result = await donationRequestsCollection.updateOne(
+        await donationRequestsCollection.updateOne(
           { _id: new ObjectId(id) },
           {
             $set: {
@@ -525,13 +487,12 @@ async function run() {
           }
         );
 
-        res.send({ success: true, result });
+        res.send({ success: true });
       } catch {
         res.status(500).send({ message: "Server error" });
       }
     });
 
-    // ✅ Donor delete own request
     app.delete("/donation-requests/:id", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const { id } = req.params;
@@ -553,7 +514,6 @@ async function run() {
       }
     });
 
-    // ✅ Donor set done/canceled
     app.patch("/donation-requests/:id/status", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const { id } = req.params;
@@ -588,7 +548,6 @@ async function run() {
       }
     });
 
-    // ---------------- ADMIN/VOLUNTEER DONATION REQUESTS ----------------
     app.get("/admin/donation-requests", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
       try {
         const { status, page = 1, limit = 10 } = req.query;
@@ -647,9 +606,10 @@ async function run() {
       }
     });
 
-    // ---------------- START ----------------
+    // ---------------- START SERVER ----------------
     app.listen(port, () => {
       console.log(`✅ Server listening on http://localhost:${port}`);
+      console.log("✅ Allowed origins:", allowedOrigins);
     });
   } catch (err) {
     console.error("❌ MongoDB connection failed:", err.message);
@@ -659,7 +619,6 @@ async function run() {
 
 run();
 
-// ✅ error handler at bottom
 app.use((err, req, res, next) => {
   console.error("❌ Server error:", err.message);
   res.status(500).send({ message: err.message || "Server error" });
