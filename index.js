@@ -10,7 +10,6 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 5000;
 
-// -------------------- Middlewares --------------------
 app.use(express.json());
 
 // ✅ CORS
@@ -18,18 +17,20 @@ const allowedOrigins = ["http://localhost:5173", process.env.CLIENT_URL].filter(
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS: " + origin));
+    },
     credentials: true,
   })
 );
 
-// -------------------- Firebase Admin --------------------
 const serviceAccount = require("./firebase-admin-key.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// -------------------- Env checks --------------------
 if (!process.env.DB_URI) {
   console.error("❌ DB_URI missing in .env");
   process.exit(1);
@@ -39,11 +40,9 @@ if (!process.env.JWT_SECRET) {
   process.exit(1);
 }
 
-// -------------------- Helpers --------------------
 const normalizeEmail = (email) =>
   typeof email === "string" ? email.trim().toLowerCase() : "";
 
-// -------------------- MongoDB --------------------
 const client = new MongoClient(process.env.DB_URI, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -52,7 +51,6 @@ const client = new MongoClient(process.env.DB_URI, {
   },
 });
 
-// -------------------- JWT Middleware --------------------
 const verifyJWT = (req, res, next) => {
   const authHeader = req.headers.authorization;
 
@@ -64,17 +62,15 @@ const verifyJWT = (req, res, next) => {
 
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) return res.status(401).send({ message: "Unauthorized (invalid token)" });
-    req.decoded = decoded; // { email, uid }
+    req.decoded = decoded;
     next();
   });
 };
 
-// -------------------- Basic Route --------------------
 app.get("/", (req, res) => {
   res.send("✅ Server running");
 });
 
-// -------------------- JWT Route --------------------
 app.post("/jwt", async (req, res) => {
   try {
     const { token } = req.body;
@@ -87,11 +83,9 @@ app.post("/jwt", async (req, res) => {
       return res.status(401).send({ message: "Unauthorized (no email in Firebase token)" });
     }
 
-    const serverToken = jwt.sign(
-      { email, uid: decoded.uid },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const serverToken = jwt.sign({ email, uid: decoded.uid }, process.env.JWT_SECRET, {
+      expiresIn: "7d",
+    });
 
     res.send({ token: serverToken });
   } catch (err) {
@@ -112,14 +106,12 @@ async function run() {
     const donationRequestsCollection = db.collection("donation_requests");
     const fundingCollection = db.collection("fundings");
 
-    // -------------------- Helpers --------------------
     const getDBUser = async (email) => {
       const e = normalizeEmail(email);
       if (!e) return null;
       return usersCollection.findOne({ email: e });
     };
 
-    // -------------------- Role Middlewares --------------------
     const verifyAdmin = async (req, res, next) => {
       try {
         const user = await getDBUser(req.decoded?.email);
@@ -156,11 +148,10 @@ async function run() {
       }
     };
 
-    // -------------------- USERS --------------------
+    // ---------------- USERS ----------------
     app.post("/users", async (req, res) => {
       try {
         const user = req.body;
-
         const email = normalizeEmail(user?.email);
         if (!email) return res.status(400).send({ message: "Email is required" });
 
@@ -232,7 +223,7 @@ async function run() {
       }
     });
 
-    // -------------------- FUNDINGS --------------------
+    // ---------------- FUNDINGS ----------------
     app.post("/fundings", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
@@ -263,7 +254,6 @@ async function run() {
       }
     });
 
-    // ✅ only docs that contain createdAt (removes old invalid rows)
     app.get("/fundings", verifyJWT, async (req, res) => {
       try {
         const items = await fundingCollection
@@ -277,7 +267,7 @@ async function run() {
       }
     });
 
-    // -------------------- DONATION REQUESTS --------------------
+    // ---------------- DONATION REQUESTS ----------------
 
     // ✅ PUBLIC list
     app.get("/donation-requests", async (req, res) => {
@@ -305,48 +295,7 @@ async function run() {
       }
     });
 
-    app.get("/donation-requests/:id", verifyJWT, async (req, res) => {
-      try {
-        const id = req.params.id;
-        const data = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
-        if (!data) return res.status(404).send({ message: "Request not found" });
-        res.send(data);
-      } catch (err) {
-        res.status(500).send({ message: "Server error", error: err.message });
-      }
-    });
-
-    // ✅ CREATE REQUEST (FIXED: requesterEmail always from JWT)
-    app.post("/donation-requests", verifyJWT, verifyNotBlocked, async (req, res) => {
-      try {
-        const tokenEmail = normalizeEmail(req.decoded?.email);
-        if (!tokenEmail) return res.status(401).send({ message: "Unauthorized" });
-
-        const payload = req.body || {};
-        delete payload.requesterEmail; // ✅ never trust client
-        delete payload.status; // ✅ server decides status
-
-        const dbUser = await getDBUser(tokenEmail);
-
-        const doc = {
-          ...payload,
-          requesterName: payload.requesterName || dbUser?.name || "User",
-          requesterEmail: tokenEmail,
-          status: "pending",
-          donorName: null,
-          donorEmail: null,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-
-        const result = await donationRequestsCollection.insertOne(doc);
-        res.status(201).send({ success: true, insertedId: result.insertedId });
-      } catch (err) {
-        res.status(500).send({ message: "Server error", error: err.message });
-      }
-    });
-
-    // ✅ MY RECENT
+    // ✅ ✅ IMPORTANT: put /my and /my-recent BEFORE /:id
     app.get("/donation-requests/my-recent", verifyJWT, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
@@ -362,7 +311,6 @@ async function run() {
       }
     });
 
-    // ✅ MY REQUESTS (this powers MyDonationRequests.jsx)
     app.get("/donation-requests/my", verifyJWT, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
@@ -389,10 +337,59 @@ async function run() {
       }
     });
 
+    // ✅ PRIVATE get one (after my routes)
+    app.get("/donation-requests/:id", verifyJWT, async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid request id" });
+        }
+
+        const data = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
+        if (!data) return res.status(404).send({ message: "Request not found" });
+        res.send(data);
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // ✅ CREATE REQUEST
+    app.post("/donation-requests", verifyJWT, verifyNotBlocked, async (req, res) => {
+      try {
+        const tokenEmail = normalizeEmail(req.decoded?.email);
+        if (!tokenEmail) return res.status(401).send({ message: "Unauthorized" });
+
+        const payload = req.body || {};
+        delete payload.requesterEmail;
+        delete payload.status;
+
+        const dbUser = await getDBUser(tokenEmail);
+
+        const doc = {
+          ...payload,
+          requesterName: payload.requesterName || dbUser?.name || "User",
+          requesterEmail: tokenEmail,
+          status: "pending",
+          donorName: null,
+          donorEmail: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await donationRequestsCollection.insertOne(doc);
+        res.status(201).send({ success: true, insertedId: result.insertedId });
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
     // ✅ DONOR delete own request
     app.delete("/donation-requests/:id", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
+
         const email = normalizeEmail(req.decoded?.email);
 
         const existing = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
@@ -413,6 +410,8 @@ async function run() {
     app.patch("/donation-requests/:id/status", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
+
         const email = normalizeEmail(req.decoded?.email);
         const { status } = req.body;
 
@@ -442,25 +441,66 @@ async function run() {
       }
     });
 
-    // -------------------- ADMIN/VOLUNTEER --------------------
-    app.get("/admin/stats", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
+    // ---------------- ADMIN/VOLUNTEER: DONATION REQUESTS ----------------
+    app.get("/admin/donation-requests", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
       try {
-        const totalUsers = await usersCollection.countDocuments({ role: "donor" });
-        const totalRequests = await donationRequestsCollection.countDocuments();
+        const { status, page = 1, limit = 10 } = req.query;
 
-        const fundAgg = await fundingCollection
-          .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
-          .toArray();
+        const query = {};
+        if (status) query.status = status;
 
-        const totalFunding = fundAgg[0]?.total || 0;
+        const skip = (Number(page) - 1) * Number(limit);
 
-        res.send({ totalUsers, totalRequests, totalFunding });
+        const [items, total] = await Promise.all([
+          donationRequestsCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(Number(limit))
+            .toArray(),
+          donationRequestsCollection.countDocuments(query),
+        ]);
+
+        res.send({ items, total });
       } catch {
         res.status(500).send({ message: "Server error" });
       }
     });
 
-    // -------------------- Start Server --------------------
+    app.patch("/admin/donation-requests/:id/status", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
+
+        const { status } = req.body;
+        if (!["pending", "inprogress", "done", "canceled"].includes(status)) {
+          return res.status(400).send({ message: "Invalid status" });
+        }
+
+        const result = await donationRequestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status, updatedAt: new Date() } }
+        );
+
+        res.send(result);
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    app.delete("/admin/donation-requests/:id", verifyJWT, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
+
+        const result = await donationRequestsCollection.deleteOne({ _id: new ObjectId(id) });
+        res.send(result);
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    // ---------------- START SERVER ----------------
     app.listen(port, () => {
       console.log(`✅ Server listening on http://localhost:${port}`);
     });
@@ -471,3 +511,8 @@ async function run() {
 }
 
 run();
+
+app.use((err, req, res, next) => {
+  console.error("❌ Server error:", err.message);
+  res.status(500).send({ message: err.message || "Server error" });
+});
