@@ -258,26 +258,15 @@ async function run() {
         res.status(500).send({ message: "Server error" });
       }
     });
- // ✅ Admin get users (for admin dashboard)
-app.get("/admin/users", verifyJWT, verifyAdmin, async (req, res) => {
-  try {
-    const users = await usersCollection
-      .find({}, { projection: safeUserProjection })
-      .sort({ createdAt: -1 })
-      .toArray();
 
-    res.send(users);
-  } catch (err) {
-    res.status(500).send({ message: "Server error", error: err.message });
-  }
-});
+    app.get("/admin/users", verifyJWT, verifyAdmin, async (req, res) => {
 
-// ---------------- ADMIN: USER MANAGEMENT ----------------
+        // ---------------- ADMIN: USER MANAGEMENT ----------------
 
 // ✅ Update user role (donor → volunteer/admin, volunteer → admin)
 app.patch("/admin/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { id } = req.params;              // ✅ YOU MISSED THIS
+    const { id } = req.params;
     const { role } = req.body || {};
 
     if (!ObjectId.isValid(id)) {
@@ -332,6 +321,16 @@ app.patch("/admin/users/:id/status", verifyJWT, verifyAdmin, async (req, res) =>
   }
 });
 
+      try {
+        const users = await usersCollection
+          .find({}, { projection: safeUserProjection })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send(users);
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
 
     // ---------------- ADMIN STATS ----------------
     app.get("/admin/stats", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
