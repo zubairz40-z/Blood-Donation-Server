@@ -12,25 +12,32 @@ const port = process.env.PORT || 5000;
 
 app.use(express.json());
 
-// ✅ CORS
+// ---------------- CORS ----------------
 const allowedOrigins = ["http://localhost:5173", process.env.CLIENT_URL].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, cb) => {
+      // allow requests with no origin (Postman/server-to-server)
       if (!origin) return cb(null, true);
+
+      // allow listed origins
       if (allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS: " + origin));
+
+      // block with explicit message (easier debugging than cb(null,false))
+      return cb(new Error("Not allowed by CORS: " + origin), false);
     },
     credentials: true,
   })
 );
 
+// ---------------- Firebase Admin ----------------
 const serviceAccount = require("./firebase-admin-key.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
+// ---------------- Env checks ----------------
 if (!process.env.DB_URI) {
   console.error("❌ DB_URI missing in .env");
   process.exit(1);
@@ -43,6 +50,7 @@ if (!process.env.JWT_SECRET) {
 const normalizeEmail = (email) =>
   typeof email === "string" ? email.trim().toLowerCase() : "";
 
+// ---------------- MongoDB ----------------
 const client = new MongoClient(process.env.DB_URI, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -51,6 +59,7 @@ const client = new MongoClient(process.env.DB_URI, {
   },
 });
 
+// ---------------- JWT middleware ----------------
 const verifyJWT = (req, res, next) => {
   const authHeader = req.headers.authorization;
 
@@ -67,10 +76,10 @@ const verifyJWT = (req, res, next) => {
   });
 };
 
-app.get("/", (req, res) => {
-  res.send("✅ Server running");
-});
+// ---------------- Base route ----------------
+app.get("/", (req, res) => res.send("✅ Server running"));
 
+// ---------------- JWT exchange ----------------
 app.post("/jwt", async (req, res) => {
   try {
     const { token } = req.body;
@@ -100,18 +109,32 @@ async function run() {
     console.log("✅ MongoDB connected");
 
     const db = client.db("bloodDB");
-    console.log("✅ Using DB:", db.databaseName);
-
     const usersCollection = db.collection("users");
     const donationRequestsCollection = db.collection("donation_requests");
     const fundingCollection = db.collection("fundings");
 
+    const safeUserProjection = {
+      _id: 1,
+      name: 1,
+      email: 1,
+      avatar: 1,
+      bloodGroup: 1,
+      district: 1,
+      upazila: 1,
+      role: 1,
+      status: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+
+    // helpers
     const getDBUser = async (email) => {
       const e = normalizeEmail(email);
       if (!e) return null;
       return usersCollection.findOne({ email: e });
     };
 
+    // role middlewares
     const verifyAdmin = async (req, res, next) => {
       try {
         const user = await getDBUser(req.decoded?.email);
@@ -149,21 +172,23 @@ async function run() {
     };
 
     // ---------------- USERS ----------------
+
+    // ✅ Create/Upsert user
     app.post("/users", async (req, res) => {
       try {
-        const user = req.body;
-        const email = normalizeEmail(user?.email);
+        const u = req.body || {};
+        const email = normalizeEmail(u?.email);
         if (!email) return res.status(400).send({ message: "Email is required" });
 
         const existing = await usersCollection.findOne({ email });
 
         const safeUser = {
-          name: user?.name || existing?.name || "",
+          name: u?.name || existing?.name || "",
           email,
-          avatar: user?.avatar || existing?.avatar || "",
-          bloodGroup: user?.bloodGroup || existing?.bloodGroup || "",
-          district: user?.district || existing?.district || "",
-          upazila: user?.upazila || existing?.upazila || "",
+          avatar: u?.avatar || existing?.avatar || "",
+          bloodGroup: u?.bloodGroup || existing?.bloodGroup || "",
+          district: u?.district || existing?.district || "",
+          upazila: u?.upazila || existing?.upazila || "",
           role: existing?.role || "donor",
           status: existing?.status || "active",
         };
@@ -184,18 +209,12 @@ async function run() {
       }
     });
 
+    // ✅ Logged in user profile
     app.get("/users/me", verifyJWT, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
-        const user = await usersCollection.findOne({ email });
-
-        if (!user) {
-          return res.status(404).send({
-            message: "User not found in database. Please register/complete profile.",
-            email,
-          });
-        }
-
+        const user = await usersCollection.findOne({ email }, { projection: safeUserProjection });
+        if (!user) return res.status(404).send({ message: "User not found in database.", email });
         res.send(user);
       } catch {
         res.status(500).send({ message: "Server error" });
@@ -205,7 +224,7 @@ async function run() {
     app.patch("/users/me", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
-        const { name, avatar, district, upazila, bloodGroup } = req.body;
+        const { name, avatar, district, upazila, bloodGroup } = req.body || {};
 
         const updateDoc = {
           ...(name !== undefined ? { name } : {}),
@@ -223,15 +242,111 @@ async function run() {
       }
     });
 
+    // ✅ Public users list (ONLY if you really want it public)
+    app.get("/users", async (req, res) => {
+      try {
+        const users = await usersCollection
+          .find({}, { projection: safeUserProjection })
+          .sort({ createdAt: -1 })
+          .limit(200) // prevent huge dump
+          .toArray();
+
+        res.send(users);
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    // ✅ Donor search (Search.jsx)
+    app.get("/donors", async (req, res) => {
+      try {
+        const { bloodGroup, district, upazila } = req.query;
+
+        const query = { role: "donor", status: "active" };
+        if (bloodGroup) query.bloodGroup = bloodGroup;
+        if (district) query.district = district;
+        if (upazila) query.upazila = upazila;
+
+        const donors = await usersCollection
+          .find(query, { projection: safeUserProjection })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(donors);
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    // ✅ Admin get users (for admin dashboard)
+    app.get("/admin/users", verifyJWT, verifyAdmin, async (req, res) => {
+      try {
+        const users = await usersCollection
+          .find({}, { projection: safeUserProjection })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(users);
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    // ---------------- ADMIN STATS ----------------
+    app.get("/admin/stats", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
+      try {
+        const [totalAllUsers, totalDonors, totalRequests] = await Promise.all([
+          usersCollection.countDocuments({}),
+          usersCollection.countDocuments({ role: "donor" }),
+          donationRequestsCollection.countDocuments({}),
+        ]);
+
+        const byStatusAgg = await donationRequestsCollection
+          .aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }])
+          .toArray();
+
+        const requestByStatus = byStatusAgg.reduce((acc, cur) => {
+          acc[cur._id || "unknown"] = cur.count;
+          return acc;
+        }, {});
+
+        const fundAgg = await fundingCollection
+          .aggregate([
+            {
+              $group: {
+                _id: null,
+                totalFunding: { $sum: "$amount" },
+                totalFundingCount: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray();
+
+        const totalFunding = fundAgg[0]?.totalFunding || 0;
+        const totalFundingCount = fundAgg[0]?.totalFundingCount || 0;
+
+        res.send({
+          totalAllUsers,
+          totalUsers: totalDonors,
+          totalRequests,
+          totalFunding,
+          totalFundingCount,
+          requestByStatus,
+        });
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
     // ---------------- FUNDINGS ----------------
     app.post("/fundings", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
-        const { amount, trxId, note } = req.body;
+        const { amount, trxId, note } = req.body || {};
 
         const numericAmount = Number(amount);
-        if (!numericAmount || numericAmount < 10) {
-          return res.status(400).send({ message: "Amount must be at least 10" });
+        if (!numericAmount || numericAmount <= 0) {
+          return res.status(400).send({ message: "Valid amount required" });
         }
 
         const dbUser = await getDBUser(email);
@@ -254,13 +369,15 @@ async function run() {
       }
     });
 
+    // ✅ fundings list: admin sees all, others see own
     app.get("/fundings", verifyJWT, async (req, res) => {
       try {
-        const items = await fundingCollection
-          .find({ createdAt: { $exists: true } })
-          .sort({ createdAt: -1 })
-          .toArray();
+        const email = normalizeEmail(req.decoded?.email);
+        const dbUser = await getDBUser(email);
 
+        const query = dbUser?.role === "admin" ? {} : { email };
+
+        const items = await fundingCollection.find(query).sort({ createdAt: -1 }).toArray();
         res.send(items);
       } catch (err) {
         res.status(500).send({ message: "Server error", error: err.message });
@@ -269,7 +386,7 @@ async function run() {
 
     // ---------------- DONATION REQUESTS ----------------
 
-    // ✅ PUBLIC list
+    // ✅ Public list
     app.get("/donation-requests", async (req, res) => {
       try {
         const { status, page = 1, limit = 12 } = req.query;
@@ -295,7 +412,7 @@ async function run() {
       }
     });
 
-    // ✅ ✅ IMPORTANT: put /my and /my-recent BEFORE /:id
+    // ✅ IMPORTANT: keep /my and /my-recent BEFORE /:id
     app.get("/donation-requests/my-recent", verifyJWT, async (req, res) => {
       try {
         const email = normalizeEmail(req.decoded?.email);
@@ -304,7 +421,6 @@ async function run() {
           .sort({ createdAt: -1 })
           .limit(3)
           .toArray();
-
         res.send(result);
       } catch {
         res.status(500).send({ message: "Server error" });
@@ -337,39 +453,36 @@ async function run() {
       }
     });
 
-    // ✅ PRIVATE get one (after my routes)
+    // ✅ Private details
     app.get("/donation-requests/:id", verifyJWT, async (req, res) => {
       try {
-        const id = req.params.id;
-
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ message: "Invalid request id" });
-        }
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
 
         const data = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
         if (!data) return res.status(404).send({ message: "Request not found" });
+
         res.send(data);
       } catch (err) {
         res.status(500).send({ message: "Server error", error: err.message });
       }
     });
 
-    // ✅ CREATE REQUEST
+    // ✅ Create request
     app.post("/donation-requests", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
-        const tokenEmail = normalizeEmail(req.decoded?.email);
-        if (!tokenEmail) return res.status(401).send({ message: "Unauthorized" });
-
+        const email = normalizeEmail(req.decoded?.email);
         const payload = req.body || {};
+
         delete payload.requesterEmail;
         delete payload.status;
 
-        const dbUser = await getDBUser(tokenEmail);
+        const dbUser = await getDBUser(email);
 
         const doc = {
           ...payload,
           requesterName: payload.requesterName || dbUser?.name || "User",
-          requesterEmail: tokenEmail,
+          requesterEmail: email,
           status: "pending",
           donorName: null,
           donorEmail: null,
@@ -384,10 +497,44 @@ async function run() {
       }
     });
 
-    // ✅ DONOR delete own request
+    // ✅ Donate route
+    app.patch("/donation-requests/:id/donate", verifyJWT, verifyNotBlocked, async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
+
+        const { donorName, donorEmail } = req.body || {};
+        if (!donorEmail) return res.status(400).send({ message: "donorEmail required" });
+
+        const existing = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
+        if (!existing) return res.status(404).send({ message: "Request not found" });
+
+        if (existing.status !== "pending") {
+          return res.status(400).send({ message: "Only pending requests can be donated" });
+        }
+
+        const result = await donationRequestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: "inprogress",
+              donorName: donorName || "Donor",
+              donorEmail,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        res.send({ success: true, result });
+      } catch {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    // ✅ Donor delete own request
     app.delete("/donation-requests/:id", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
-        const id = req.params.id;
+        const { id } = req.params;
         if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
 
         const email = normalizeEmail(req.decoded?.email);
@@ -406,14 +553,14 @@ async function run() {
       }
     });
 
-    // ✅ DONOR set done/canceled
+    // ✅ Donor set done/canceled
     app.patch("/donation-requests/:id/status", verifyJWT, verifyNotBlocked, async (req, res) => {
       try {
-        const id = req.params.id;
+        const { id } = req.params;
         if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
 
         const email = normalizeEmail(req.decoded?.email);
-        const { status } = req.body;
+        const { status } = req.body || {};
 
         if (!["done", "canceled"].includes(status)) {
           return res.status(400).send({ message: "Donor can only set done or canceled" });
@@ -441,7 +588,7 @@ async function run() {
       }
     });
 
-    // ---------------- ADMIN/VOLUNTEER: DONATION REQUESTS ----------------
+    // ---------------- ADMIN/VOLUNTEER DONATION REQUESTS ----------------
     app.get("/admin/donation-requests", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
       try {
         const { status, page = 1, limit = 10 } = req.query;
@@ -469,10 +616,10 @@ async function run() {
 
     app.patch("/admin/donation-requests/:id/status", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
       try {
-        const id = req.params.id;
+        const { id } = req.params;
         if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
 
-        const { status } = req.body;
+        const { status } = req.body || {};
         if (!["pending", "inprogress", "done", "canceled"].includes(status)) {
           return res.status(400).send({ message: "Invalid status" });
         }
@@ -490,7 +637,7 @@ async function run() {
 
     app.delete("/admin/donation-requests/:id", verifyJWT, verifyAdmin, async (req, res) => {
       try {
-        const id = req.params.id;
+        const { id } = req.params;
         if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid request id" });
 
         const result = await donationRequestsCollection.deleteOne({ _id: new ObjectId(id) });
@@ -500,7 +647,7 @@ async function run() {
       }
     });
 
-    // ---------------- START SERVER ----------------
+    // ---------------- START ----------------
     app.listen(port, () => {
       console.log(`✅ Server listening on http://localhost:${port}`);
     });
@@ -512,6 +659,7 @@ async function run() {
 
 run();
 
+// ✅ error handler at bottom
 app.use((err, req, res, next) => {
   console.error("❌ Server error:", err.message);
   res.status(500).send({ message: err.message || "Server error" });
