@@ -258,18 +258,80 @@ async function run() {
         res.status(500).send({ message: "Server error" });
       }
     });
+ // ✅ Admin get users (for admin dashboard)
+app.get("/admin/users", verifyJWT, verifyAdmin, async (req, res) => {
+  try {
+    const users = await usersCollection
+      .find({}, { projection: safeUserProjection })
+      .sort({ createdAt: -1 })
+      .toArray();
 
-    app.get("/admin/users", verifyJWT, verifyAdmin, async (req, res) => {
-      try {
-        const users = await usersCollection
-          .find({}, { projection: safeUserProjection })
-          .sort({ createdAt: -1 })
-          .toArray();
-        res.send(users);
-      } catch {
-        res.status(500).send({ message: "Server error" });
-      }
-    });
+    res.send(users);
+  } catch (err) {
+    res.status(500).send({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------------- ADMIN: USER MANAGEMENT ----------------
+
+// ✅ Update user role (donor → volunteer/admin, volunteer → admin)
+app.patch("/admin/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;              // ✅ YOU MISSED THIS
+    const { role } = req.body || {};
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid user id" });
+    }
+
+    if (!["donor", "volunteer", "admin"].includes(role)) {
+      return res.status(400).send({ message: "Invalid role" });
+    }
+
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { role, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
+    res.send({ success: true });
+  } catch (err) {
+    res.status(500).send({ message: "Server error", error: err.message });
+  }
+});
+
+// ✅ Block / Unblock user
+app.patch("/admin/users/:id/status", verifyJWT, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body || {};
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid user id" });
+    }
+
+    if (!["active", "blocked"].includes(status)) {
+      return res.status(400).send({ message: "Invalid status" });
+    }
+
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
+    res.send({ success: true });
+  } catch (err) {
+    res.status(500).send({ message: "Server error", error: err.message });
+  }
+});
+
 
     // ---------------- ADMIN STATS ----------------
     app.get("/admin/stats", verifyJWT, verifyVolunteerOrAdmin, async (req, res) => {
